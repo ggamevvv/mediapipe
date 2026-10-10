@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>미세 파티클 제스처 유체역학</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #000; 
+            color: white; 
+            font-family: 'Inter', 'Noto Sans KR', sans-serif; 
+        }
+        
+        /* 웹캠 배경 비디오 (가장 아래 배치: z-index 0) */
+        #input_video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            z-index: 0;
+            transform: scaleX(-1); /* 거울 모드 */
+            opacity: 0.7; /* 파티클과 얼굴이 모두 잘 보이도록 투명도 조절 */
+        }
+
+        /* Three.js 3D 파티클 캔버스 (중간: z-index 1) */
+        #three-canvas { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100vw; 
+            height: 100vh; 
+            z-index: 1; 
+            pointer-events: none;
+        }
+
+        /* MediaPipe 스켈레톤 오버레이 캔버스 (가장 위: z-index 2) */
+        #output_canvas { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100vw; 
+            height: 100vh; 
+            z-index: 2; 
+            pointer-events: none;
+            transform: scaleX(-1); /* 비디오와 동일하게 좌우 반전 */
+            object-fit: cover;
+        }
+        
+        #ui { 
+            position: absolute; 
+            top: 20px; 
+            left: 20px; 
+            z-index: 10; 
+            background: rgba(15, 23, 42, 0.75); 
+            padding: 24px; 
+            border-radius: 16px; 
+            backdrop-filter: blur(12px); 
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255,255,255,0.2); 
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5); 
+            max-width: 320px;
+        }
+        
+        .gesture-indicator { 
+            font-weight: 800; 
+            font-size: 1.8rem; 
+            color: #38bdf8; 
+            margin-top: 5px; 
+            letter-spacing: 1px; 
+            transition: color 0.3s ease; 
+        }
+        
+        /* 로딩 화면 스타일 */
+        #loading { 
+            position: absolute; 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%); 
+            z-index: 20; 
+            background: rgba(0, 0, 0, 0.85); 
+            padding: 40px; 
+            border-radius: 16px; 
+            text-align: center; 
+            border: 1px solid rgba(255,255,255,0.1); 
+            backdrop-filter: blur(5px);
+        }
+        
+        .spinner { 
+            border: 4px solid rgba(255,255,255,0.1); 
+            width: 48px; 
+            height: 48px; 
+            border-radius: 50%; 
+            border-left-color: #38bdf8; 
+            animation: spin 1s linear infinite; 
+            margin: 0 auto 20px auto; 
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div class="font-semibold tracking-wide text-lg text-white">AI 모델 초기화 중...</div>
+        <div class="text-sm text-gray-400 mt-2">카메라 권한을 허용하고 잠시만 기다려주세요.</div>
+    </div>
+    
+    <div id="ui">
+        <div class="text-xs text-gray-400 tracking-widest font-bold mb-1">현재 손동작</div>
+        <div id="gesture-text" class="gesture-indicator">대기 중</div>
+        <div class="text-sm text-gray-300 mt-5 space-y-2 leading-relaxed">
+            <p><span class="text-white font-bold">1. 꼬집기 (Pinch):</span> 강력한 블랙홀 인력</p>
+            <p><span class="text-white font-bold">2. 주먹 (Grab):</span> 손 중심으로 넓게 응집</p>
+            <p><span class="text-white font-bold">3. 가리키기 (Point):</span> 검지 궤적 따라가기</p>
+            <p><span class="text-white font-bold">4. 손 펴기 (Open):</span> 파티클 얼음(정지)</p>
+            <p><span class="text-white font-bold">5. 브이 (Peace):</span> 두 갈래로 밀어내기</p>
+        </div>
+    </div>
+
+    <!-- 비디오 및 캔버스 레이어 -->
+    <video id="input_video" autoplay playsinline></video>
+    <canvas id="three-canvas"></canvas>
+    <canvas id="output_canvas"></canvas>
+
+    <script>
+        const NUM_PARTICLES = 3000;
+        let particles, geometry, material;
+        let positions, velocities, originalPositions;
+        
+        const canvas = document.getElementById('three-canvas');
+        const renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        
+        const scene = new THREE.Scene();
+        let aspect = window.innerWidth / window.innerHeight;
+        const camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
+        camera.position.z = 15;
+
+        // 파티클을 네모가 아닌 선명한 '점(원)'으로 만들기 위한 텍스처 생성
+        function createCircleTexture() {
+            const size = 128; // 해상도를 높여 선명하게
+            const texCanvas = document.createElement('canvas');
+            texCanvas.width = size;
+            texCanvas.height = size;
+            const context = texCanvas.getContext('2d');
+            
+            // 검은색 배경 (alphaMap 적용 시 투명해짐)
+            context.fillStyle = '#000000';
+            context.fillRect(0, 0, size, size);
+            
+            // 부드러운 엣지를 가진 하얀색 원
+            context.beginPath();
+            context.arc(size/2, size/2, size/2 - 4, 0, Math.PI * 2);
+            context.fillStyle = '#ffffff';
+            context.fill();
+            
+            return new THREE.CanvasTexture(texCanvas);
+        }
+
+        function initParticles() {
+            geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(NUM_PARTICLES * 3);
+            velocities = new Float32Array(NUM_PARTICLES * 3);
+            originalPositions = new Float32Array(NUM_PARTICLES * 3);
+
+            const spreadX = 35 * aspect;
+            const spreadY = 35;
+
+            // 파티클을 화면 전체에 고르게 분초
+            for (let i = 0; i < NUM_PARTICLES; i++) {
+                const x = (Math.random() - 0.5) * spreadX;
+                const y = (Math.random() - 0.5) * spreadY;
+                const z = (Math.random() - 0.5) * 10;
+                
+                positions[i * 3] = x;
+                positions[i * 3 + 1] = y;
+                positions[i * 3 + 2] = z;
+
+                originalPositions[i * 3] = x;
+                originalPositions[i * 3 + 1] = y;
+                originalPositions[i * 3 + 2] = z;
+
+                velocities[i * 3] = 0;
+                velocities[i * 3 + 1] = 0;
+                velocities[i * 3 + 2] = 0;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            material = new THREE.PointsMaterial({
+                color: 0x38bdf8,
+                size: 0.15, // 이전(0.04)보다 큰 '중간' 사이즈 적용
+                alphaMap: createCircleTexture(),
+                transparent: true,
+                alphaTest: 0.1, // 투명도가 일정 이하인 픽셀은 렌더링하지 않아 사각형 테두리를 방지
+                opacity: 0.9,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending // 밝게 겹치는 효과
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+        initParticles();
+
+        let handCenter = new THREE.Vector3();
+        let indexTipPos = new THREE.Vector3();
+        let middleTipPos = new THREE.Vector3();
+        let pinchCenter = new THREE.Vector3();
+        
+        let currentGesture = 'NONE';
+        const gestureText = document.getElementById('gesture-text');
+        
+        function getDist2D(p1, p2) {
+            return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+        }
+
+        // 2D 카메라 좌표를 Three.js의 3D 월드 좌표로 변환
+        function mapTo3D(landmark) {
+            const scalarY = 20;
+            const scalarX = 20 * aspect;
+            // 카메라 화면이 반전(-scaleX)되어 있으므로 X축을 반전 매핑
+            return new THREE.Vector3(
+                -(landmark.x - 0.5) * scalarX, 
+                -(landmark.y - 0.5) * scalarY, 
+                -landmark.z * 15 
+            );
+        }
+
+        function detectGesture(landmarks) {
+            const wrist = landmarks[0];
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            
+            const indexMcp = landmarks[5];
+            const middleMcp = landmarks[9];
+            const ringMcp = landmarks[13];
+            const pinkyMcp = landmarks[17];
+
+            // 손가락이 펴져있는지 여부 계산 (손목과 끝점의 거리가 손목과 마디의 거리보다 충분히 큰가)
+            const isIndexExtended = getDist2D(indexTip, wrist) > getDist2D(indexMcp, wrist) * 1.2;
+            const isMiddleExtended = getDist2D(middleTip, wrist) > getDist2D(middleMcp, wrist) * 1.2;
+            const isRingExtended = getDist2D(ringTip, wrist) > getDist2D(ringMcp, wrist) * 1.2;
+            const isPinkyExtended = getDist2D(pinkyTip, wrist) > getDist2D(pinkyMcp, wrist) * 1.2;
+            const isThumbExtended = getDist2D(thumbTip, pinkyMcp) > 0.15;
+
+            // 1. PINCH (꼬집기): 엄지와 검지가 닿아있고 나머지는 접힘
+            const pinchDist = getDist2D(thumbTip, indexTip);
+            if (pinchDist < 0.05 && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                return 'PINCH';
+            }
+
+            // 3. POINT (검지 가리키기): 검지만 펴짐
+            if (isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                return 'POINT';
+            }
+
+            // 5. PEACE (브이): 검지와 중지만 펴짐
+            if (isIndexExtended && isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                return 'PEACE';
+            }
+
+            // 4. OPEN (손 펴기): 모든 손가락 펴짐
+            if (isIndexExtended && isMiddleExtended && isRingExtended && isPinkyExtended && isThumbExtended) {
+                return 'OPEN';
+            }
+
+            // 2. GRAB (주먹): 모든 손가락 접힘
+            if (!isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                return 'GRAB';
+            }
+
+            return 'NONE';
+        }
+
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+
+        function onResults(results) {
+            if (loadingElement) loadingElement.style.display = 'none';
+
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 손 스켈레톤 그리기
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: 'rgba(255, 255, 255, 0.7)', lineWidth: 4});
+                drawLandmarks(canvasCtx, landmarks, {color: '#38bdf8', lineWidth: 1, radius: 5});
+
+                // 3D 랜드마크 위치 갱신
+                handCenter = mapTo3D(landmarks[9]); 
+                indexTipPos = mapTo3D(landmarks[8]);
+                middleTipPos = mapTo3D(landmarks[12]);
+                
+                const tTip = mapTo3D(landmarks[4]);
+                pinchCenter.addVectors(tTip, indexTipPos).multiplyScalar(0.5); // 엄지와 검지의 중간점
+
+                currentGesture = detectGesture(landmarks);
+                
+                // 제스처에 따른 UI 및 파티클 색상 설정
+                const uiData = {
+                    'PINCH': { text: '꼬집기 (Pinch)', color: '#a855f7' },
+                    'GRAB':  { text: '주먹 쥐기 (Grab)', color: '#ef4444' },
+                    'POINT': { text: '가리키기 (Point)', color: '#f59e0b' },
+                    'OPEN':  { text: '정지 (Open)', color: '#3b82f6' },
+                    'PEACE': { text: '브이 (Peace)', color: '#10b981' },
+                    'NONE':  { text: '인식 안됨', color: '#6b7280' }
+                };
+                
+                gestureText.innerText = uiData[currentGesture].text;
+                gestureText.style.color = uiData[currentGesture].color;
+                
+                if (currentGesture !== 'NONE') {
+                    material.color.setHex(parseInt(uiData[currentGesture].color.replace('#', '0x')));
+                } else {
+                    material.color.setHex(0x38bdf8);
+                }
+
+            } else {
+                currentGesture = 'NONE';
+                gestureText.innerText = '손 없음';
+                gestureText.style.color = '#6b7280';
+                material.color.setHex(0x38bdf8);
+            }
+            canvasCtx.restore();
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        hands.setOptions({
+            maxNumHands: 1, 
+            modelComplexity: 1,
+            minDetectionConfidence: 0.75,
+            minTrackingConfidence: 0.75
+        });
+        hands.onResults(onResults);
+
+        const camera_mp = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+        camera_mp.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = 0.016; 
+            const positionsArr = particles.geometry.attributes.position.array;
+
+            // '손 펴기(OPEN)' 동작일 때 저항(마찰)을 극도로 높여 파티클을 공중에 얼림
+            let damping = currentGesture === 'OPEN' ? 0.20 : 0.94;
+
+            for (let i = 0; i < NUM_PARTICLES; i++) {
+                const ix = i * 3, iy = i * 3 + 1, iz = i * 3 + 2;
+
+                let px = positionsArr[ix], py = positionsArr[iy], pz = positionsArr[iz];
+                let vx = velocities[ix], vy = velocities[iy], vz = velocities[iz];
+
+                // 기본 복원력 (천천히 원래 위치로 돌아가려는 힘)
+                let fx = (originalPositions[ix] - px) * 0.1;
+                let fy = (originalPositions[iy] - py) * 0.1;
+                let fz = (originalPositions[iz] - pz) * 0.1;
+
+                // 제스처별 물리력 적용
+                if (currentGesture !== 'NONE') {
+                    if (currentGesture === 'PINCH') {
+                        // 강력한 국지적 인력 (블랙홀)
+                        const dx = pinchCenter.x - px, dy = pinchCenter.y - py, dz = pinchCenter.z - pz;
+                        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist < 15) { 
+                            const pull = (1 / (dist + 0.1)) * 60; 
+                            fx += (dx / dist) * pull; fy += (dy / dist) * pull; fz += (dz / dist) * pull;
+                        }
+                    } 
+                    else if (currentGesture === 'GRAB') {
+                        // 손 중심으로 넓게 당기기
+                        const dx = handCenter.x - px, dy = handCenter.y - py, dz = handCenter.z - pz;
+                        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist < 25) {
+                            const pull = dist * 2.0; 
+                            fx += (dx / dist) * pull; fy += (dy / dist) * pull; fz += (dz / dist) * pull;
+                        }
+                    }
+                    else if (currentGesture === 'POINT') {
+                        // 검지 끝을 졸졸 따라다니는 힘
+                        const dx = indexTipPos.x - px, dy = indexTipPos.y - py, dz = indexTipPos.z - pz;
+                        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist < 20) {
+                            const pull = (1 / (dist + 0.1)) * 45;
+                            fx += (dx / dist) * pull; fy += (dy / dist) * pull; fz += (dz / dist) * pull;
+                        }
+                    }
+                    else if (currentGesture === 'PEACE') {
+                        // 검지와 중지에서 강력하게 밀어내는 척력 (두 갈래)
+                        const dx1 = px - indexTipPos.x, dy1 = py - indexTipPos.y, dz1 = pz - indexTipPos.z;
+                        const dist1 = Math.sqrt(dx1*dx1 + dy1*dy1 + dz1*dz1);
+                        
+                        const dx2 = px - middleTipPos.x, dy2 = py - middleTipPos.y, dz2 = pz - middleTipPos.z;
+                        const dist2 = Math.sqrt(dx2*dx2 + dy2*dy2 + dz2*dz2);
+
+                        if (dist1 < 12) {
+                            const push = Math.max(0, 12 - dist1) * 35;
+                            fx += (dx1 / dist1) * push; fy += (dy1 / dist1) * push; fz += (dz1 / dist1) * push;
+                        }
+                        if (dist2 < 12) {
+                            const push = Math.max(0, 12 - dist2) * 35;
+                            fx += (dx2 / dist2) * push; fy += (dy2 / dist2) * push; fz += (dz2 / dist2) * push;
+                        }
+                    }
+                }
+
+                // 속도 및 위치 업데이트 (오일러 적분)
+                vx += fx * dt; vy += fy * dt; vz += fz * dt;
+                vx *= damping; vy *= damping; vz *= damping;
+                px += vx * dt; py += vy * dt; pz += vz * dt;
+
+                velocities[ix] = vx; velocities[iy] = vy; velocities[iz] = vz;
+                positionsArr[ix] = px; positionsArr[iy] = py; positionsArr[iz] = pz;
+            }
+
+            particles.geometry.attributes.position.needsUpdate = true;
+            
+            // 전체 파티클 시스템을 아주 천천히 회전시켜 생동감 부여
+            particles.rotation.y = Math.sin(Date.now() * 0.00015) * 0.05;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            aspect = window.innerWidth / window.innerHeight;
+            camera.aspect = aspect;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        });
+    </script>
+</body>
+</html>
